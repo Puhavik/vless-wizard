@@ -19,7 +19,7 @@ import importlib.util
 from datetime import datetime
 from pathlib import Path
 from functools import partial
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote_plus
 import webbrowser
 from packaging import version
 
@@ -255,21 +255,107 @@ def should_exclude(host: str) -> bool:
             return True
     return False
 
-def get_sni_whitelist(raw_url: str = "https://raw.githubusercontent.com/yukikras/vless-wizard/main/sni.txt"):
+_SNI_SOURCES = [
+    # Основной список проекта
+    "https://raw.githubusercontent.com/yukikras/vless-wizard/main/sni.txt",
+    # Актуальный белый список мобильного интернета России (обновляется автоматически)
+    "https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/main/whitelist.txt",
+]
+
+def _make_ssl_context():
+    """Создаёт SSL-контекст с certifi (решает проблему macOS Python без системных сертификатов)."""
+    import ssl as _ssl
     try:
-        req = Request(raw_url, headers={"User-Agent": "sni-filter/1.0"})
-        with urlopen(req, timeout=20) as resp:
+        import certifi as _certifi
+        return _ssl.create_default_context(cafile=_certifi.where())
+    except ImportError:
+        pass
+    try:
+        return _ssl.create_default_context()
+    except Exception:
+        # Последний резерв: без проверки сертификата
+        ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = _ssl.CERT_NONE
+        return ctx
+
+def _fetch_sni_source(url: str) -> list[str]:
+    """Загружает один источник SNI и возвращает список hostname-строк."""
+    try:
+        ctx = _make_ssl_context()
+        req = Request(url, headers={"User-Agent": "sni-filter/1.0"})
+        with urlopen(req, timeout=20, context=ctx) as resp:
             data = resp.read().decode(errors="ignore")
+        hosts = []
+        for line in data.splitlines():
+            stripped = line.strip()
+            # Пропускаем комментарии, пустые строки и vless:// конфиги
+            if not stripped or stripped.startswith('#') or '://' in stripped:
+                continue
+            host = normalize_host(stripped)
+            if host:
+                hosts.append(host)
+        return hosts
     except Exception as e:
-        print("Ошибка загрузки списка sni:", e)
+        print(f"Ошибка загрузки SNI-списка ({url}): {e}")
         return []
-    hosts = []
-    for line in data.splitlines():
-        host = normalize_host(line)
-        if host:
-            hosts.append(host)
-    unique_hosts = list(dict.fromkeys(hosts))
-    filtered = [h for h in unique_hosts if not should_exclude(h)]
+
+def _is_good_sni(host: str) -> bool:
+    """Дополнительный фильтр: убирает CDN-мусор и числовые субдомены."""
+    parts = host.split('.')
+    if len(parts) < 2:
+        return False
+    first = parts[0].lower()
+    if first.isdigit():
+        return False
+    bad_prefixes = {'img', 'cdn', 'static', 'media', 'assets', 'files',
+                    'upload', 'cache', 'thumb', 'pic', 'tile', 'avatar'}
+    if first in bad_prefixes:
+        return False
+    return True
+
+def _load_local_sni_fallback() -> list[str]:
+    """Читает локальный sni.txt как запасной вариант при отсутствии сети."""
+    try:
+        local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sni.txt')
+        with open(local_path, encoding='utf-8', errors='ignore') as f:
+            hosts = []
+            for line in f:
+                stripped = line.strip()
+                if not stripped or stripped.startswith('#') or '://' in stripped:
+                    continue
+                host = normalize_host(stripped)
+                if host:
+                    hosts.append(host)
+            return hosts
+    except Exception:
+        return []
+
+def get_sni_whitelist(raw_url: str = "") -> list[str]:
+    """Загружает все источники SNI, объединяет, фильтрует и перемешивает.
+
+    При запуске всегда скачивает свежие списки с GitHub (два источника).
+    Если оба источника недоступны — падает на локальный sni.txt.
+    """
+    all_hosts: list[str] = []
+    sources = [raw_url] if raw_url else _SNI_SOURCES
+    for url in sources:
+        hosts = _fetch_sni_source(url)
+        all_hosts.extend(hosts)
+
+    # Если ни один источник не ответил — берём локальный файл
+    if not all_hosts:
+        print("SNI: сеть недоступна, используем локальный sni.txt")
+        all_hosts = _load_local_sni_fallback()
+
+    # Дедупликация с сохранением порядка
+    seen: set[str] = set()
+    unique: list[str] = []
+    for h in all_hosts:
+        if h not in seen:
+            seen.add(h)
+            unique.append(h)
+    filtered = [h for h in unique if not should_exclude(h) and _is_good_sni(h)]
     random.shuffle(filtered)
     return filtered
 
@@ -1126,7 +1212,7 @@ class PagePanelAuth(BaseWizardPage):
         
         self.url_label = QLabel("URL адрес панели:")
         self.panel_url_input = QLineEdit()
-        self.panel_url_input.setPlaceholderText("URL адрес 3x-ui панели")
+        self.panel_url_input.setPlaceholderText("Например: http://1.2.3.4:8080/webpath/")
         
         self.username_label = QLabel("Логин:")
         self.username_input = QLineEdit()
@@ -1148,8 +1234,16 @@ class PagePanelAuth(BaseWizardPage):
         )
         self.status_label.setOpenExternalLinks(True)
 
+        self.url_hint_label = QLabel(
+            "💡 Включите webpath в URL, если он настроен. "
+            "Например: <code>http://IP:8080/webpath/</code>"
+        )
+        self.url_hint_label.setWordWrap(True)
+        self.url_hint_label.setStyleSheet("color: gray; font-size: 11px;")
+
         input_layout.addWidget(self.url_label)
         input_layout.addWidget(self.panel_url_input)
+        input_layout.addWidget(self.url_hint_label)
         input_layout.addWidget(self.username_label)
         input_layout.addWidget(self.username_input)
         input_layout.addWidget(self.password_label)
@@ -1286,61 +1380,128 @@ class PagePanelAuth(BaseWizardPage):
             return None
 
     def _try_auto_auth(self, credentials):
+        """
+        Try to authenticate using stored credentials.
+        If the stored URL is http:// but the panel has SSL, also tries https://.
+        """
+        if not credentials.get('url') or not credentials.get('username') or not credentials.get('password'):
+            return False
+
+        url = credentials['url']
+        username = credentials['username']
+        password = credentials['password']
+
+        # Build list of URLs to try: original, and https-fallback if original is http
+        urls_to_try = [url]
+        parsed_orig = urlparse(url)
+        if parsed_orig.scheme == 'http':
+            https_url = url.replace('http://', 'https://', 1)
+            urls_to_try.append(https_url)
+
+        for try_url in urls_to_try:
+            result = self._attempt_single_auth(try_url, username, password)
+            if result:
+                return True
+
+        return False
+
+    def _attempt_single_auth(self, url, username, password):
+        """Авторизация через urllib с Mac (обходит IP-ограничение сервера).
+        Используется для авто-заполнения из сохранённых данных.
+        Та же логика что и в _do_auth, но возвращает bool.
+        """
+        import urllib.request, urllib.parse, urllib.error
+        import http.cookiejar, ssl as ssl_mod, base64 as b64, re as _re
         try:
-            if not credentials.get('url') or not credentials.get('username') or not credentials.get('password'):
-                return False
-                
-            url = credentials['url']
-            username = credentials['username']
-            password = credentials['password']
-            
             parsed = urlparse(url)
             hostname = parsed.hostname or "127.0.0.1"
             port = parsed.port or (443 if parsed.scheme == 'https' else 80)
             full_path = parsed.path.strip('/')
-            
             clean_path = re.sub(r'(\/panel.*$)', '', f"/{full_path}").strip('/')
-            
             use_https = parsed.scheme == 'https'
-            protocol = "https" if use_https else "http"
-            
-            cookie_jar = f"/tmp/xui_cookie_{secrets.token_hex(4)}.jar"
-            login_url = f"{protocol}://127.0.0.1:{port}"
-            if clean_path:
-                login_url += f"/{clean_path}"
-            login_url += "/login"
-            
-            login_json = json.dumps({"username": username, "password": password}).replace('"', '\\"')
             ssl_options = "-k" if use_https else ""
-            
-            host_header = f'-H "Host: {hostname}"' if use_https else ""
-            
-            cmd = (
-                f'COOKIE_JAR={cookie_jar} && '
-                f'LOGIN_RESPONSE=$(curl -s {ssl_options} -c "$COOKIE_JAR" -X POST "{login_url}" '
-                f'{host_header} -H "Content-Type: application/json" -d "{login_json}") && '
-                f'if echo "$LOGIN_RESPONSE" | grep -q \'"success":true\'; then '
-                f'  echo "AUTH_SUCCESS"; '
-                f'else '
-                f'  echo "AUTH_FAILED"; '
-                f'fi'
+            base_url_str = (
+                f"https://{hostname}:{port}" + (f"/{clean_path}" if clean_path else "")
+                if use_https else
+                f"http://{hostname}:{port}" + (f"/{clean_path}" if clean_path else "")
             )
-            
-            exit_code, out, err = self.ssh_mgr.exec_command(cmd, timeout=20)
-            
-            if "AUTH_SUCCESS" in out:
-                self.panel_info = {
-                    'port': port,
-                    'webpath': clean_path,
-                    'base_url': f"{protocol}://127.0.0.1:{port}" + (f"/{clean_path}" if clean_path else ""),
-                    'use_https': use_https,
-                    'cookie_jar': cookie_jar
-                }
-                return True
-            else:
+            login_url_str = base_url_str + "/login"
+            csrf_url_str  = base_url_str + "/panel/csrf-token"
+            cookie_jar    = f"/tmp/xui_cookie_{secrets.token_hex(4)}.jar"
+
+            ctx = ssl_mod.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode    = ssl_mod.CERT_NONE
+
+            jar    = http.cookiejar.CookieJar()
+            opener = urllib.request.build_opener(
+                urllib.request.HTTPSHandler(context=ctx),
+                urllib.request.HTTPCookieProcessor(jar),
+            )
+            opener.addheaders = [
+                ('User-Agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'),
+                ('Accept',     'application/json, text/html, */*'),
+            ]
+
+            # GET login page → сессионная кука + CSRF в <meta>
+            login_page_body = ''
+            try:
+                resp0 = opener.open(base_url_str + '/', timeout=10)
+                login_page_body = resp0.read().decode('utf-8', errors='ignore')
+            except Exception:
+                pass
+
+            # CSRF из <meta name="csrf-token" content="...">
+            csrf_for_login = ''
+            m = _re.search(r'<meta\s+name=["\']csrf-token["\']\s+content=["\']([^"\']+)["\']',
+                           login_page_body)
+            if m:
+                csrf_for_login = m.group(1)
+
+            # POST /login
+            origin_val = f"https://{hostname}:{port}" if use_https else f"http://{hostname}:{port}"
+            post_data  = urllib.parse.urlencode({'username': username, 'password': password}).encode()
+            req = urllib.request.Request(login_url_str, data=post_data, method='POST')
+            req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+            req.add_header('Origin',  origin_val)
+            req.add_header('Referer', base_url_str + '/')
+            if csrf_for_login:
+                req.add_header('X-CSRF-Token', csrf_for_login)
+
+            resp = opener.open(req, timeout=15)
+            body = resp.read().decode('utf-8', errors='ignore')
+            result = json.loads(body)
+            if not result.get('success'):
                 return False
-                
-        except Exception as e:
+
+            # API CSRF для дальнейших запросов
+            csrf_api = ''
+            try:
+                csrf_resp = opener.open(urllib.request.Request(csrf_url_str), timeout=10)
+                csrf_api  = json.loads(csrf_resp.read().decode()).get('obj', '')
+            except Exception:
+                pass
+
+            # Сериализуем куки и загружаем на сервер
+            lines = ['# Netscape HTTP Cookie File']
+            for c in jar:
+                domain = c.domain or hostname
+                flag   = 'TRUE' if getattr(c, 'domain_initial_dot', False) else 'FALSE'
+                path   = c.path or '/'
+                secure = 'TRUE' if c.secure else 'FALSE'
+                expiry = str(int(c.expires)) if c.expires else '0'
+                lines.append(f"{domain}\t{flag}\t{path}\t{secure}\t{expiry}\t{c.name}\t{c.value}")
+            cookie_b64 = b64.b64encode(('\n'.join(lines) + '\n').encode()).decode()
+            self.ssh_mgr.exec_command(f"echo '{cookie_b64}' | base64 -d > {cookie_jar}", timeout=10)
+
+            self.panel_info = {
+                'port': port, 'webpath': clean_path, 'base_url': base_url_str,
+                'use_https': use_https, 'cookie_jar': cookie_jar,
+                'csrf_token': csrf_api, 'curl_opts': ssl_options,
+            }
+            return True
+
+        except Exception:
             return False
 
     @Slot()
@@ -1456,61 +1617,134 @@ class PagePanelAuth(BaseWizardPage):
         error_msg = [None]
         
         def _do_auth():
+            import urllib.request
+            import urllib.parse
+            import urllib.error
+            import http.cookiejar
+            import ssl as ssl_mod
+            import base64 as b64
+
             try:
                 if not self.ensure_ssh_connection():
                     error_msg[0] = "SSH соединение потеряно"
                     return
-                    
+
                 parsed = urlparse(url)
                 hostname = parsed.hostname or "127.0.0.1"
                 port = parsed.port or (443 if parsed.scheme == 'https' else 80)
                 full_path = parsed.path.strip('/')
-                
                 clean_path = re.sub(r'(\/panel.*$)', '', f"/{full_path}").strip('/')
-                
                 use_https = parsed.scheme == 'https'
-                protocol = "https" if use_https else "http"
-                
-                self.panel_info = {
-                    'port': port,
-                    'webpath': clean_path,
-                    'base_url': f"{protocol}://127.0.0.1:{port}" + (f"/{clean_path}" if clean_path else ""),
-                    'use_https': use_https
-                }
-                
-                cookie_jar = f"/tmp/xui_cookie_{secrets.token_hex(4)}.jar"
-                login_url = f"{protocol}://127.0.0.1:{port}"
-                if clean_path:
-                    login_url += f"/{clean_path}"
-                login_url += "/login"
-                
-                login_json = json.dumps({"username": username, "password": password}).replace('"', '\\"')
                 ssl_options = "-k" if use_https else ""
-                
-                host_header = f'-H "Host: {hostname}"' if use_https else ""
-                
-                cmd = (
-                    f'COOKIE_JAR={cookie_jar} && '
-                    f'LOGIN_RESPONSE=$(curl -s {ssl_options} -c "$COOKIE_JAR" -X POST "{login_url}" '
-                    f'{host_header} -H "Content-Type: application/json" -d "{login_json}") && '
-                    f'if echo "$LOGIN_RESPONSE" | grep -q \'"success":true\'; then '
-                    f'  echo "AUTH_SUCCESS"; '
-                    f'else '
-                    f'  echo "AUTH_FAILED"; '
-                    f'fi'
+                base_url_str = (
+                    f"https://{hostname}:{port}" + (f"/{clean_path}" if clean_path else "")
+                    if use_https else
+                    f"http://{hostname}:{port}" + (f"/{clean_path}" if clean_path else "")
                 )
-                
-                exit_code, out, err = self.ssh_mgr.exec_command(cmd, timeout=30)
-                
-                if "AUTH_SUCCESS" in out:
-                    success[0] = True
-                    self.panel_info['cookie_jar'] = cookie_jar
+                login_url_str = base_url_str + "/login"
+                csrf_url_str  = base_url_str + "/panel/csrf-token"
+                cookie_jar    = f"/tmp/xui_cookie_{secrets.token_hex(4)}.jar"
+
+                # ── Авторизация с Mac через urllib (обходит IP-ограничение на сервере) ──
+                ctx = ssl_mod.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode    = ssl_mod.CERT_NONE
+
+                jar    = http.cookiejar.CookieJar()
+                opener = urllib.request.build_opener(
+                    urllib.request.HTTPSHandler(context=ctx),
+                    urllib.request.HTTPCookieProcessor(jar),
+                )
+                opener.addheaders = [
+                    ('User-Agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'),
+                    ('Accept',     'application/json, text/html, */*'),
+                ]
+
+                # Step 1: GET login page → устанавливает сессионную куку + возвращает CSRF в <meta>
+                login_page_body = ''
+                try:
+                    resp0 = opener.open(base_url_str + '/', timeout=10)
+                    login_page_body = resp0.read().decode('utf-8', errors='ignore')
+                except Exception:
+                    pass
+
+                # Step 2: читаем CSRF токен из <meta name="csrf-token" content="...">
+                # (3x-ui v3.x хранит токен в HTML, не в cookie)
+                import re as _re
+                csrf_for_login = ''
+                m = _re.search(r'<meta\s+name=["\']csrf-token["\']\s+content=["\']([^"\']+)["\']', login_page_body)
+                if m:
+                    csrf_for_login = m.group(1)
                 else:
-                    success[0] = False
-                    error_msg[0] = "Неверные учетные данные"
-                
+                    # fallback: ищем в куках на случай старой версии
+                    for cookie in jar:
+                        if 'csrf' in cookie.name.lower():
+                            csrf_for_login = cookie.value
+                            break
+
+                # Step 3: POST /login
+                origin_val = f"https://{hostname}:{port}" if use_https else f"http://{hostname}:{port}"
+                post_data  = urllib.parse.urlencode(
+                    {'username': username, 'password': password}
+                ).encode()
+                req = urllib.request.Request(login_url_str, data=post_data, method='POST')
+                req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+                req.add_header('Origin',   origin_val)
+                req.add_header('Referer',  base_url_str + '/')
+                if csrf_for_login:
+                    req.add_header('X-CSRF-Token', csrf_for_login)
+
+                try:
+                    resp = opener.open(req, timeout=15)
+                    body = resp.read().decode('utf-8', errors='ignore')
+                    result = json.loads(body)
+                    if not result.get('success'):
+                        error_msg[0] = f"Неверный логин/пароль: {result.get('msg', body[:200])}"
+                        return
+                except urllib.error.HTTPError as e:
+                    err_body = e.read().decode('utf-8', errors='ignore')[:300]
+                    error_msg[0] = f"HTTP {e.code} от панели: {err_body}"
+                    return
+                except Exception as e:
+                    error_msg[0] = f"Ошибка подключения к панели: {e}"
+                    return
+
+                # Step 4: получаем CSRF-токен для API-вызовов
+                csrf_api = ''
+                try:
+                    csrf_resp = opener.open(urllib.request.Request(csrf_url_str), timeout=10)
+                    csrf_api  = json.loads(csrf_resp.read().decode()).get('obj', '')
+                except Exception:
+                    pass
+
+                # Step 5: сериализуем куки в Netscape-формат и загружаем на сервер
+                lines = ['# Netscape HTTP Cookie File']
+                for c in jar:
+                    domain = c.domain or hostname
+                    flag   = 'TRUE' if getattr(c, 'domain_initial_dot', False) else 'FALSE'
+                    path   = c.path or '/'
+                    secure = 'TRUE' if c.secure else 'FALSE'
+                    expiry = str(int(c.expires)) if c.expires else '0'
+                    lines.append(f"{domain}\t{flag}\t{path}\t{secure}\t{expiry}\t{c.name}\t{c.value}")
+                cookie_content = '\n'.join(lines) + '\n'
+
+                cookie_b64 = b64.b64encode(cookie_content.encode()).decode()
+                write_cmd  = f"echo '{cookie_b64}' | base64 -d > {cookie_jar}"
+                self.ssh_mgr.exec_command(write_cmd, timeout=10)
+
+                success[0] = True
+                self.panel_info = {
+                    'port':      port,
+                    'webpath':   clean_path,
+                    'base_url':  base_url_str,
+                    'use_https': use_https,
+                    'cookie_jar': cookie_jar,
+                    'csrf_token': csrf_api,
+                    'curl_opts':  ssl_options,
+                }
+
             except Exception as e:
-                success[0] = False
+                success[0]   = False
                 error_msg[0] = str(e)
         
         t = threading.Thread(target=_do_auth, daemon=True)
@@ -1525,9 +1759,17 @@ class PagePanelAuth(BaseWizardPage):
             return True
         else:
             self.auth_successful = False
-            self.status_label.setText(f"Ошибка авторизации: {error_msg[0] or 'Таймаут'}")
-            QMessageBox.warning(self, "Ошибка авторизации", 
-                                f"Не удалось авторизоваться в 3x-ui панели:\n{error_msg[0] or 'Таймаут'}")
+            err = error_msg[0] or 'Таймаут'
+            self.status_label.setText(f"Ошибка авторизации: {err}")
+            parsed_url = urlparse(url)
+            webpath_hint = ""
+            if not parsed_url.path.strip('/'):
+                webpath_hint = ("\n\n⚠️ URL не содержит webpath.\n"
+                                "Если в 3x-ui настроен webpath (базовый путь),\n"
+                                "добавьте его в URL. Например:\n"
+                                "http://IP:8080/мой-путь/")
+            QMessageBox.warning(self, "Ошибка авторизации",
+                                f"Не удалось авторизоваться в 3x-ui панели:\n{err}{webpath_hint}")
             return False
 
     def get_panel_info(self):
@@ -1618,52 +1860,73 @@ class PageBackupPanel(BaseWizardPage):
         error_msg = [None]
         
         def _do_backup():
+            remote_backup = f"/tmp/xui_backup_{secrets.token_hex(4)}.db"
+            tmp_path = None
             try:
                 if not self.ensure_ssh_connection():
                     error_msg[0] = "SSH соединение потеряно и не может быть восстановлено"
                     return
-                    
-                backup_url = f"{self.panel_info['base_url']}/server/getDb"
-                
-                hostname = "127.0.0.1"
-                ssl_options = "-k" if self.panel_info.get('use_https', False) else ""
-                host_header = f'-H "Host: {hostname}"' if self.panel_info.get('use_https', False) else ""
+
+                backup_url = f"{self.panel_info['base_url']}/panel/api/server/getDb"
+                ssl_options = self.panel_info.get('curl_opts', "-k" if self.panel_info.get('use_https', False) else "")
                 cookie_jar = self.panel_info.get('cookie_jar', '')
-                
+
                 if not cookie_jar:
                     error_msg[0] = "Файл cookies не найден"
                     return
-                
-                cmd = (
-                    f'curl -s {ssl_options} -b "{cookie_jar}" "{backup_url}" '
-                    f'{host_header} -H "Accept: application/octet-stream"'
-                )
-                
+
                 self.log_message("[backup] Запрашиваем резервную копию базы данных")
                 self.log_message(f"[backup] URL: {backup_url}")
-                
+
+                # Сохраняем бинарный файл на сервере через curl -o
+                cmd = (
+                    f'curl -s {ssl_options} -b "{cookie_jar}" "{backup_url}" '
+                    f'-H "Accept: application/octet-stream" -o "{remote_backup}" '
+                    f'&& echo "BACKUP_OK" || echo "BACKUP_FAILED"'
+                )
                 exit_code, out, err = self.ssh_mgr.exec_command(cmd, timeout=30)
-                
-                if exit_code == 0 and out:
-                    if len(out) > 100 and not out.startswith('<!DOCTYPE') and not out.startswith('<html'):
-                        success[0] = True
-                        self.backup_data = out
-                        self.log_message(f"[backup] Резервная копия получена успешно, размер: {len(out)} байт")
-                    else:
-                        success[0] = False
-                        error_msg[0] = "Получен некорректный ответ (возможно, требуется повторная авторизация)"
-                        self.log_message("[backup] Получен HTML вместо бинарных данных")
-                        if len(out) < 500:
-                            self.log_message(f"[backup] Ответ: {out[:200]}...")
-                else:
-                    success[0] = False
-                    error_msg[0] = f"Ошибка выполнения команды: {err}"
-                    self.log_message(f"[backup] Ошибка: exit_code={exit_code}, err={err}")
-                    
+
+                if "BACKUP_OK" not in out:
+                    error_msg[0] = "Ошибка загрузки резервной копии на сервере"
+                    self.log_message(f"[backup] Ошибка: {out.strip()} / {err.strip()}")
+                    return
+
+                # Проверяем размер файла
+                _, size_out, _ = self.ssh_mgr.exec_command(
+                    f"stat -c%s {remote_backup} 2>/dev/null || wc -c < {remote_backup} 2>/dev/null || echo 0"
+                )
+                file_size = int(size_out.strip()) if size_out.strip().isdigit() else 0
+
+                if file_size < 100:
+                    error_msg[0] = "Получен пустой ответ (возможно, требуется повторная авторизация)"
+                    self.log_message("[backup] Файл слишком мал — скорее всего вернулся HTML-ответ об ошибке")
+                    return
+
+                # Скачиваем бинарник через SFTP — без потери байт
+                with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp:
+                    tmp_path = tmp.name
+
+                self.ssh_mgr.download_file(remote_backup, tmp_path)
+
+                with open(tmp_path, 'rb') as f:
+                    self.backup_data = f.read()
+
+                self.log_message(f"[backup] Резервная копия получена успешно, размер: {len(self.backup_data)} байт")
+                success[0] = True
+
             except Exception as e:
                 success[0] = False
                 error_msg[0] = str(e)
                 self.log_message(f"[backup error] {e}")
+            finally:
+                # Удаляем временный файл на сервере
+                self.ssh_mgr.exec_command(f"rm -f {remote_backup} 2>/dev/null || true")
+                # Удаляем локальный временный файл
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
         
         t = threading.Thread(target=_do_backup, daemon=True)
         t.start()
@@ -2245,6 +2508,7 @@ class PageInbound(BaseWizardPage):
     test_completed_signal = Signal(dict)
     xray_log_signal = Signal(str)
     curl_log_signal = Signal(str)
+    confirm_replace_signal = Signal(str)  # sni
     
     def __init__(self, ssh_mgr: SSHManager, logger_sig: LoggerSignal, log_window: LogWindow, sni_manager: SNIManager, page_auth):
         super().__init__(ssh_mgr, logger_sig, log_window, sni_manager)
@@ -2257,6 +2521,12 @@ class PageInbound(BaseWizardPage):
         self.test_completed_signal.connect(self.on_test_completed)
         self.xray_log_signal.connect(self.log_window.append_xray_log)
         self.curl_log_signal.connect(self.log_window.append_curl_log)
+        self.confirm_replace_signal.connect(self._show_confirm_replace_dialog)
+
+        # Синхронизация диалога подтверждения между worker-потоком и GUI-потоком
+        self._confirm_event = threading.Event()
+        self._confirm_result = False
+        self._server_has_openssl: bool | None = None  # кэш: None = не проверялось
         
         self.speedtest_log_window = SpeedtestLogWindow()
         
@@ -2375,6 +2645,7 @@ class PageInbound(BaseWizardPage):
         self.generated_config = None
         self.panel_info = None
         self.cookie_jar = None
+        self.csrf_token = None
         self.server_host = None
         self.existing_clients = []
         self.current_sni = None
@@ -2537,55 +2808,186 @@ class PageInbound(BaseWizardPage):
         
         threading.Thread(target=self._regenerate_vless_worker, daemon=True).start()
 
+    # ─── Тест доступности SNI без изменения inbound ───────────────────────────
+
+    def _test_sni_from_server(self, sni: str) -> bool:
+        """Проверяет пригодность SNI-домена для VLESS REALITY без изменения inbound.
+
+        Требования REALITY:
+          1. Порт 443 достижим с сервера
+          2. Домен поддерживает TLS 1.3
+          3. Домен поддерживает ALPN h2 (HTTP/2)
+
+        Алгоритм:
+          - Сначала пробуем openssl s_client (точная проверка TLS 1.3 + H2).
+          - Если openssl не установлен — fallback на curl (проверяет только достижимость).
+        """
+        try:
+            # ── Шаг 1: проверяем наличие openssl (кэшируем результат) ───────
+            if self._server_has_openssl is None:
+                _, openssl_out, _ = self.ssh_mgr.exec_command(
+                    'command -v openssl && echo "OPENSSL_OK"', timeout=5
+                )
+                self._server_has_openssl = 'OPENSSL_OK' in openssl_out
+
+            if self._server_has_openssl:
+                # ── Шаг 2a: TLS 1.3 + H2 через openssl s_client ─────────────
+                # Запускаем два теста параллельно одной командой
+                cmd = (
+                    # TLS 1.3
+                    f'TLS13=$(echo Q | timeout 6 openssl s_client '
+                    f'-connect {sni}:443 -tls1_3 -servername {sni} 2>/dev/null'
+                    f' | grep -c "TLSv1.3"); '
+                    # H2 ALPN
+                    f'H2=$(echo Q | timeout 6 openssl s_client '
+                    f'-connect {sni}:443 -tls1_3 -alpn h2 -servername {sni} 2>/dev/null'
+                    f' | grep -c "h2"); '
+                    f'echo "TLS13:$TLS13 H2:$H2"'
+                )
+                _, out, _ = self.ssh_mgr.exec_command(cmd, timeout=20)
+
+                tls13 = False
+                h2    = False
+                for line in out.splitlines():
+                    line = line.strip()
+                    if line.startswith('TLS13:'):
+                        parts = line.split()
+                        for p in parts:
+                            if p.startswith('TLS13:'):
+                                tls13 = p[6:].strip() != '0'
+                            if p.startswith('H2:'):
+                                h2 = p[3:].strip() != '0'
+
+                if not tls13:
+                    self._emit_test_log(f"  ✗ {sni}: TLS 1.3 не поддерживается")
+                    return False
+                if not h2:
+                    self._emit_test_log(f"  ✗ {sni}: ALPN h2 (HTTP/2) не поддерживается")
+                    return False
+
+                self._emit_test_log(f"  ✓ {sni}: TLS 1.3 + H2 — подходит для REALITY")
+                return True
+
+            else:
+                # ── Шаг 2b: fallback — просто проверяем достижимость curl ───
+                self._emit_test_log(f"  openssl не найден, fallback на curl для {sni}")
+                cmd = (
+                    f'HTTP_CODE=$(curl -s --connect-timeout 5 --max-time 8 '
+                    f'-o /dev/null -w "%{{http_code}}" -k "https://{sni}/" 2>/dev/null); '
+                    f'echo "HTTP:$HTTP_CODE"'
+                )
+                _, out, _ = self.ssh_mgr.exec_command(cmd, timeout=15)
+                for line in out.splitlines():
+                    if line.startswith('HTTP:'):
+                        code = line[5:].strip()
+                        ok = code != '000' and code != ''
+                        if ok:
+                            self._emit_test_log(f"  ✓ {sni}: порт 443 доступен (curl, HTTP {code})")
+                        else:
+                            self._emit_test_log(f"  ✗ {sni}: порт 443 недоступен")
+                        return ok
+
+        except Exception as e:
+            self._emit_test_log(f"  Ошибка теста SNI {sni}: {e}")
+        return False
+
+    @Slot(str)
+    def _show_confirm_replace_dialog(self, sni: str):
+        """Показывает диалог подтверждения замены (выполняется в GUI-потоке)."""
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Заменить существующий ключ?")
+        msg.setIcon(QMessageBox.Information)
+        msg.setText(
+            f"SNI <b>{sni}</b> проверен — домен доступен с вашего сервера.<br><br>"
+            f"Заменить существующий ключ на новый с этим SNI?"
+        )
+        msg.setTextFormat(Qt.TextFormat.RichText)
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg.setDefaultButton(QMessageBox.Yes)
+        self._confirm_result = (msg.exec() == QMessageBox.Yes)
+        self._confirm_event.set()
+
+    def _ask_confirm_replace(self, sni: str) -> bool:
+        """Вызывается из worker-потока — блокирует до ответа пользователя (макс. 120 сек)."""
+        self._confirm_event.clear()
+        self._confirm_result = False
+        self.confirm_replace_signal.emit(sni)
+        self._confirm_event.wait(timeout=120)
+        return self._confirm_result
+
+    # ─────────────────────────────────────────────────────────────────────────
+
     def _regenerate_vless_worker(self):
         try:
             if not self.current_inbound_id:
                 self._emit_test_log("Проверяем существующие inbound...")
                 self._check_existing_inbound_sync()
-            
+
             priv_key, pub_key = self._get_keys()
             if not priv_key or not pub_key:
                 self._emit_test_log("Не удалось получить ключи")
                 return
-                
+
             sni = self.get_next_regenerate_sni()
             if not sni:
                 self._emit_test_log("Нет доступных SNI")
                 self.reset_sni_priority()
                 return
-                
+
+            # ── Тест доступности SNI с сервера (без изменения inbound) ──────
+            self._emit_test_log(f"Проверяем доступность SNI: {sni}...")
+            sni_ok = self._test_sni_from_server(sni)
+            if not sni_ok:
+                self._emit_test_log(f"SNI {sni} недоступен с сервера — пропускаем")
+                self.sni_manager.mark_sni_used(sni)
+                QMetaObject.invokeMethod(self, "_update_status_success",
+                                         Qt.QueuedConnection,
+                                         Q_ARG(str, f"SNI {sni} недоступен, нажмите ещё раз для следующего"))
+                return
+            self._emit_test_log(f"SNI {sni} доступен ✓")
+
+            # ── Если inbound уже существует — спрашиваем подтверждение ──────
+            if self.current_inbound_id:
+                confirmed = self._ask_confirm_replace(sni)
+                if not confirmed:
+                    self._emit_test_log("Замена отменена пользователем")
+                    QMetaObject.invokeMethod(self, "_update_status_success",
+                                             Qt.QueuedConnection,
+                                             Q_ARG(str, "Замена отменена"))
+                    return
+
+            # ── Обновляем/создаём inbound ────────────────────────────────────
             if self.current_inbound_id:
                 success = self._update_inbound_with_keys(priv_key, pub_key, sni)
             else:
                 success = self._create_inbound_with_keys(priv_key, pub_key, sni)
-                
+
             if success:
                 self._emit_test_log("Vless ключ успешно сгенерирован")
-                QMetaObject.invokeMethod(self, "_update_status_success", 
-                                       Qt.QueuedConnection,
-                                       Q_ARG(str, "Vless ключ сгенерирован"))
+                QMetaObject.invokeMethod(self, "_update_status_success",
+                                         Qt.QueuedConnection,
+                                         Q_ARG(str, "Vless ключ сгенерирован"))
             else:
                 self._emit_test_log("Ошибка генерации Vless ключа")
-                
+
         except Exception as e:
             self._emit_test_log(f"Ошибка генерации: {e}")
     
     def _check_existing_inbound_sync(self):
         try:
             base_url = self.panel_info['base_url']
-            use_https = self.panel_info.get('use_https', False)
-            ssl_options = "-k" if use_https else ""
-            
-            cmd_list = f'curl -s {ssl_options} -b "{self.cookie_jar}" -X POST "{base_url}/panel/inbound/list"'
-            
+            ssl_options = self.panel_info.get('curl_opts', "-k" if self.panel_info.get('use_https', False) else "")
+
+            cmd_list = f'curl -s {ssl_options} -b "{self.cookie_jar}" "{base_url}/panel/api/inbounds/list"'
+
             exit_code, out, err = self.ssh_mgr.exec_command(cmd_list)
-            
+
             if exit_code != 0:
                 raise Exception(f"Ошибка curl: {err}")
-            
+
             cleaned_out = self.clean_json_response(out)
             result = json.loads(cleaned_out)
-            
+
             if result.get('success'):
                 inbounds = result.get('obj', [])
                 
@@ -2667,8 +3069,15 @@ class PageInbound(BaseWizardPage):
                 break
                 
             sni_type = "приоритетный" if not self.priority_sni_used else "обычный"
-            self._emit_test_log(f"Тестируем {sni_type} SNI: {sni}")
-            
+            self._emit_test_log(f"Проверяем доступность {sni_type} SNI: {sni}...")
+
+            # ── Быстрый TLS-тест с сервера — не трогаем inbound ─────────────
+            if not self._test_sni_from_server(sni):
+                self._emit_test_log(f"SNI {sni} недоступен с сервера — пропускаем")
+                self.sni_manager.mark_sni_used(sni)
+                continue
+            self._emit_test_log(f"SNI {sni} доступен ✓ — обновляем конфигурацию")
+
             config_updated = self._update_configuration_with_sni(sni)
             if not config_updated:
                 self._emit_test_log(f"Ошибка обновления конфигурации для SNI: {sni}")
@@ -2758,10 +3167,9 @@ class PageInbound(BaseWizardPage):
     def _get_keys(self):
         try:
             base_url = self.panel_info['base_url']
-            use_https = self.panel_info.get('use_https', False)
-            ssl_options = "-k" if use_https else ""
-            
-            cmd_get_keys = f'curl -s {ssl_options} -b "{self.cookie_jar}" -X POST "{base_url}/server/getNewX25519Cert" -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" -H "X-Requested-With: XMLHttpRequest"'
+            ssl_options = self.panel_info.get('curl_opts', "-k" if self.panel_info.get('use_https', False) else "")
+
+            cmd_get_keys = f'curl -s {ssl_options} -b "{self.cookie_jar}" "{base_url}/panel/api/server/getNewX25519Cert"'
             
             self._emit_test_log("Получаем ключи...")
             
@@ -2788,9 +3196,8 @@ class PageInbound(BaseWizardPage):
     def _create_inbound_with_keys(self, priv_key, pub_key, sni):
         try:
             base_url = self.panel_info['base_url']
-            use_https = self.panel_info.get('use_https', False)
-            ssl_options = "-k" if use_https else ""
-            
+            ssl_options = self.panel_info.get('curl_opts', "-k" if self.panel_info.get('use_https', False) else "")
+
             short_id = secrets.token_hex(8)
             client_id = str(uuid.uuid4())
             
@@ -2850,17 +3257,20 @@ class PageInbound(BaseWizardPage):
                 "routeOnly": False
             }
             
-            from urllib.parse import quote_plus
             settings_enc = quote_plus(json.dumps(settings, indent=2))
             stream_enc = quote_plus(json.dumps(stream_settings, indent=2))
             sniffing_enc = quote_plus(json.dumps(sniffing, indent=2))
-            
+
+            csrf_token = self.panel_info.get('csrf_token', '')
+            csrf_header = f'-H "X-CSRF-Token: {csrf_token}"' if csrf_token else ''
+
             cmd_add = (
-                f'curl -s {ssl_options} -b "{self.cookie_jar}" -X POST "{base_url}/panel/inbound/add" -d '
+                f'curl -s {ssl_options} -b "{self.cookie_jar}" -X POST "{base_url}/panel/api/inbounds/add" '
+                f'{csrf_header} -d '
                 f'"up=0&down=0&total=0&remark=reality443-auto&enable=true&expiryTime=0&listen=&port=443&protocol=vless&'
                 f'settings={settings_enc}&streamSettings={stream_enc}&sniffing={sniffing_enc}"'
             )
-            
+
             self._emit_test_log(f"Создаем inbound с SNI: {sni}")
             
             exit_code, out, err = self.ssh_mgr.exec_command(cmd_add)
@@ -2883,9 +3293,8 @@ class PageInbound(BaseWizardPage):
     def _update_inbound_with_keys(self, priv_key, pub_key, sni):
         try:
             base_url = self.panel_info['base_url']
-            use_https = self.panel_info.get('use_https', False)
-            ssl_options = "-k" if use_https else ""
-            
+            ssl_options = self.panel_info.get('curl_opts', "-k" if self.panel_info.get('use_https', False) else "")
+
             short_id = secrets.token_hex(8)
             
             if self.existing_clients:
@@ -2953,17 +3362,20 @@ class PageInbound(BaseWizardPage):
                 "routeOnly": False
             }
             
-            from urllib.parse import quote_plus
             settings_enc = quote_plus(json.dumps(settings, indent=2))
             stream_enc = quote_plus(json.dumps(stream_settings, indent=2))
             sniffing_enc = quote_plus(json.dumps(sniffing, indent=2))
-            
+
+            csrf_token = self.panel_info.get('csrf_token', '')
+            csrf_header = f'-H "X-CSRF-Token: {csrf_token}"' if csrf_token else ''
+
             cmd_update = (
-                f'curl -s {ssl_options} -b "{self.cookie_jar}" -X POST "{base_url}/panel/inbound/update/{self.current_inbound_id}" -d '
+                f'curl -s {ssl_options} -b "{self.cookie_jar}" -X POST "{base_url}/panel/api/inbounds/update/{self.current_inbound_id}" '
+                f'{csrf_header} -d '
                 f'"up=0&down=0&total=0&remark=reality443-auto&enable=true&expiryTime=0&listen=&port=443&protocol=vless&'
                 f'settings={settings_enc}&streamSettings={stream_enc}&sniffing={sniffing_enc}"'
             )
-            
+
             self._emit_test_log(f"Обновляем inbound с SNI: {sni}")
             
             exit_code, out, err = self.ssh_mgr.exec_command(cmd_update)
@@ -3076,6 +3488,7 @@ class PageInbound(BaseWizardPage):
         self.update_sni_info()
         self.panel_info = self.page_auth.get_panel_info()
         self.cookie_jar = self.panel_info.get('cookie_jar', '')
+        self.csrf_token = self.panel_info.get('csrf_token', '')
         
         self.reset_sni_priority()
         
@@ -3102,30 +3515,32 @@ class PageInbound(BaseWizardPage):
 
     def check_existing_inbound(self):
         self.log_message("Проверяем существующие inbound...")
-        
-        if not self.ensure_ssh_connection():
-            self.status_label.setText("Ошибка: SSH соединение потеряно")
-            return
-            
-        base_url = self.panel_info['base_url']
-        use_https = self.panel_info.get('use_https', False)
-        ssl_options = "-k" if use_https else ""
-        
-        cmd_list = f'curl -s {ssl_options} -b "{self.cookie_jar}" -X POST "{base_url}/panel/inbound/list"'
-        
+        self.status_label.setText("Проверка существующих настроек...")
+        threading.Thread(target=self._check_inbound_worker, daemon=True).start()
+
+    def _check_inbound_worker(self):
         try:
+            if not self.ensure_ssh_connection():
+                QMetaObject.invokeMethod(self.status_label, "setText",
+                    Qt.QueuedConnection, Q_ARG(str, "Ошибка: SSH соединение потеряно"))
+                return
+
+            base_url = self.panel_info['base_url']
+            ssl_options = self.panel_info.get('curl_opts', "-k" if self.panel_info.get('use_https', False) else "")
+
+            cmd_list = f'curl -s {ssl_options} -b "{self.cookie_jar}" "{base_url}/panel/api/inbounds/list"'
             exit_code, out, err = self.ssh_mgr.exec_command(cmd_list)
-            
+
             if exit_code != 0:
                 raise Exception(f"Ошибка curl: {err}")
-            
+
             cleaned_out = self.clean_json_response(out)
             result = json.loads(cleaned_out)
-            
+
             if result.get('success'):
                 inbounds = result.get('obj', [])
                 inbound_found = False
-                
+
                 for inbound in inbounds:
                     if inbound.get('port') == 443:
                         self.current_inbound_id = inbound.get('id')
@@ -3133,28 +3548,28 @@ class PageInbound(BaseWizardPage):
                         self.log_message(f"Найден inbound-443 с ID: {self.current_inbound_id}")
                         self.existing_clients = self.get_existing_clients(inbound)
                         self.log_message(f"Найдено клиентов: {len(self.existing_clients)}")
-                        
                         for i, client in enumerate(self.existing_clients):
-                            current_flow = client.get('flow', 'не установлен')
-                            self.log_message(f"Клиент {i+1}: flow={current_flow}")
-                        
+                            self.log_message(f"Клиент {i+1}: flow={client.get('flow', 'не установлен')}")
                         break
-                
-                if inbound_found:
-                    self.status_label.setText("Найден существующий инбаунд. Нажмите 'Настроить (VPN) Vless' для подбора SNI")
-                else:
-                    self.status_label.setText("Инбаунд не найден. Нажмите 'Настроить (VPN) Vless' для создания")
+
+                msg = (
+                    "Найден существующий инбаунд. Нажмите 'Не работает VPN - сгенерировать Vless ключ' для подбора SNI"
+                    if inbound_found else
+                    "Инбаунд не найден. Нажмите 'Не работает VPN - сгенерировать Vless ключ' для создания"
+                )
+                QMetaObject.invokeMethod(self.status_label, "setText",
+                    Qt.QueuedConnection, Q_ARG(str, msg))
             else:
                 raise Exception(f"API ошибка: {result.get('msg', 'Unknown error')}")
-                
+
         except Exception as e:
-            self.log_message(f"Ошибка проверки: {e}")
-            if "10054" in str(e):
-                self.log_message("Повторяем запрос...")
-                time.sleep(2)
-                self.check_existing_inbound()
-            else:
-                self.handle_api_error(str(e))
+            self.log_message(f"Ошибка проверки inbound: {e}")
+            QMetaObject.invokeMethod(self, "_on_check_inbound_error",
+                Qt.QueuedConnection, Q_ARG(str, str(e)))
+
+    @Slot(str)
+    def _on_check_inbound_error(self, error_msg):
+        self.handle_api_error(error_msg)
 
     def get_existing_clients(self, inbound):
         try:
